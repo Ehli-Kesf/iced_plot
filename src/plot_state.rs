@@ -543,20 +543,29 @@ impl PlotState {
     pub(crate) fn handle_touch_event(
         &mut self,
         event: &touch::Event,
+        cursor: mouse::Cursor,
         widget: &PlotWidget,
         publish_hover_pick: &mut Option<HoverPickEvent>,
         publish_drag_event: &mut Option<DragEvent>,
     ) -> Option<bool> {
-        let (touch::Event::FingerPressed { id, position }
-        | touch::Event::FingerMoved { id, position }
-        | touch::Event::FingerLifted { id, position }
-        | touch::Event::FingerLost { id, position }) = event;
+        let (touch::Event::FingerPressed { id, .. }
+        | touch::Event::FingerMoved { id, .. }
+        | touch::Event::FingerLifted { id, .. }
+        | touch::Event::FingerLost { id, .. }) = event;
 
-        // `fingers` ve pinch merkezi WIDGET-YEREL uzayda tutulur — `cursor_position`
-        // ve `screen_to_render` bu uzayı bekler. Sentetik `mouse::Cursor` ise ham
-        // PENCERE konumunu alır; `cursor_local_position` bounds'ı kendisi çıkarır.
-        let local = Vec2::new(position.x - self.bounds.x, position.y - self.bounds.y);
-        let cursor = mouse::Cursor::Available(*position);
+        // Konum `touch::Event.position`'dan DEĞİL, `cursor`'dan okunur.
+        //
+        // Kritik: `scrollable` çocuğuna bounds'ı KENDİ içerik uzayında verir ve
+        // cursor'ı kaydırma kadar öteler; ama `touch::Event.position` ham PENCERE
+        // koordinatı olarak kalır. Ham konumu kullanırsak panel kaydırıldıkça
+        // `local` translation kadar şaşar: dokunulan plot "dışarıda" sayılır
+        // (olay yutulmaz → panel kayar) ve BİR ÜSTTEKİ plot aralığa denk gelip
+        // hareket eder. Cursor zaten doğru uzaydadır — iced onu ötelemiştir.
+        //
+        // Bu, cursor'ı dokunuştan sentezleyen winit yamasına bağımlılık yaratır;
+        // Android'de yama tam da bunu yapar (stok iced widget'ları da aynı
+        // sentezi kullanır, yoksa hiçbir buton dokunuşla çalışmazdı).
+        let local = self.cursor_local_position(cursor, true)?;
         let viewport: DVec2 = Vec2::new(self.bounds.width, self.bounds.height).into();
 
         let mut synth = |state: &mut Self, ev: Event| {
@@ -608,12 +617,11 @@ impl PlotState {
                     return Some(self.pinch_update(viewport));
                 }
                 if self.touch.active_finger == Some(id.0) {
-                    return Some(synth(
-                        self,
-                        Event::CursorMoved {
-                            position: *position,
-                        },
-                    ));
+                    // `handle_mouse_event`'in CursorMoved kolu konumu `cursor`'dan
+                    // okur; bu alan yalnız varyantı kurmak için gerekli.
+                    let position =
+                        iced::Point::new(local.x + self.bounds.x, local.y + self.bounds.y);
+                    return Some(synth(self, Event::CursorMoved { position }));
                 }
                 Some(false)
             }

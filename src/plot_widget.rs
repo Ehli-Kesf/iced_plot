@@ -1679,6 +1679,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
             // `Some(_)` = jest bizim → olayı yut (saran scrollable kaydırmasın).
             if let Some(touch_redraw) = state.handle_touch_event(
                 touch_event,
+                cursor,
                 widget,
                 &mut effects.hover_pick,
                 &mut effects.drag_event,
