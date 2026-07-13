@@ -1669,6 +1669,20 @@ fn update_plot_program<const IS_CANVAS: bool>(
                 _ => {}
             }
         }
+        iced::Event::Touch(touch_event) => {
+            // Dokunmatik: tek parmak → sol tuş sürüklemesi, iki parmak → pinch.
+            // Konum dokunuş olayından gelir; imleç sentezi gerekmez.
+            let touch_redraw = state.handle_touch_event(
+                touch_event,
+                widget,
+                &mut effects.hover_pick,
+                &mut effects.drag_event,
+            );
+            effects.needs_redraw |= touch_redraw;
+            if touch_redraw {
+                invalidation.overlay_layer();
+            }
+        }
         iced::Event::Keyboard(keyboard_event) => {
             if let keyboard::Event::KeyPressed { key, .. } = keyboard_event
                 && state.available_cursor_is_inside(cursor)

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{DVec2, Vec2};
@@ -5,6 +6,7 @@ use iced::{
     Color, Rectangle, keyboard,
     mouse::{self, Event},
     time::Instant,
+    touch,
 };
 
 use crate::{
@@ -60,6 +62,7 @@ pub struct PlotState {
     pub(crate) selection: SelectionState,
     pub(crate) pan: PanState,
     pub(crate) drag: DragState,
+    pub(crate) touch: TouchState,
     /// Hover/select point rendering data (for incremental rendering)
     pub(crate) highlighted_points: Arc<[HighlightPoint]>,
     // Version counters
@@ -118,6 +121,7 @@ impl Default for PlotState {
             selection: SelectionState::default(),
             pan: PanState::default(),
             drag: DragState::default(),
+            touch: TouchState::default(),
             markers_version: 1,
             lines_version: 1,
             fills_version: 1,
@@ -543,6 +547,130 @@ impl PlotState {
         (self.pan.active && self.pan.button == Some(button))
             || (self.selection.active && self.selection.button == Some(button))
             || (self.drag.active && self.drag.button == Some(button))
+    }
+
+    /// Dokunmatik olayları işler.
+    ///
+    /// Tek parmak, sol fare tuşu sürüklemesine eşlenip [`Self::handle_mouse_event`]
+    /// yoluna beslenir — pan/box-zoom/drag ayrımını `Controls` yapar, mantık
+    /// tek yerde kalır. Konum `cursor`'dan DEĞİL, dokunuş olayından alınır:
+    /// böylece davranış imleç sentezleyen bir winit yamasına bağımlı olmaz.
+    ///
+    /// İki parmak pinch-zoom'a geçer; ikinci parmak inince süren tek-parmak
+    /// jesti (sentetik bırakma ile) iptal edilir.
+    pub(crate) fn handle_touch_event(
+        &mut self,
+        event: &touch::Event,
+        widget: &PlotWidget,
+        publish_hover_pick: &mut Option<HoverPickEvent>,
+        publish_drag_event: &mut Option<DragEvent>,
+    ) -> bool {
+        let (touch::Event::FingerPressed { id, position }
+        | touch::Event::FingerMoved { id, position }
+        | touch::Event::FingerLifted { id, position }
+        | touch::Event::FingerLost { id, position }) = event;
+
+        // `fingers` ve pinch merkezi WIDGET-YEREL uzayda tutulur — `cursor_position`
+        // ve `screen_to_render` bu uzayı bekler. Sentetik `mouse::Cursor` ise ham
+        // PENCERE konumunu alır; `cursor_local_position` bounds'ı kendisi çıkarır.
+        let local = Vec2::new(position.x - self.bounds.x, position.y - self.bounds.y);
+        let cursor = mouse::Cursor::Available(*position);
+        let viewport: DVec2 = Vec2::new(self.bounds.width, self.bounds.height).into();
+
+        let mut synth = |state: &mut Self, ev: Event| {
+            state.handle_mouse_event(ev, cursor, widget, publish_hover_pick, publish_drag_event)
+        };
+
+        match event {
+            touch::Event::FingerPressed { .. } => {
+                self.touch.fingers.insert(id.0, local);
+
+                match self.touch.fingers.len() {
+                    1 => {
+                        self.touch.active_finger = Some(id.0);
+                        synth(self, Event::ButtonPressed(mouse::Button::Left))
+                    }
+                    2 => {
+                        // Pinch başlıyor: süren tek-parmak jestini sentetik
+                        // bırakmayla kapat, yoksa pan pinch ile çakışır.
+                        let mut redraw = false;
+                        if self.touch.active_finger.is_some() {
+                            self.touch.active_finger = None;
+                            redraw |= synth(self, Event::ButtonReleased(mouse::Button::Left));
+                        }
+                        let pts: Vec<Vec2> = self.touch.fingers.values().copied().collect();
+                        self.touch.pinch_start_dist = Some(pts[0].distance(pts[1]).max(1.0));
+                        self.touch.pinch_start_half_extents = self.camera.half_extents;
+                        redraw
+                    }
+                    // 3+ parmak: yoksay.
+                    _ => false,
+                }
+            }
+            touch::Event::FingerMoved { .. } => {
+                self.touch.fingers.insert(id.0, local);
+
+                if self.touch.fingers.len() >= 2 {
+                    return self.pinch_update(viewport);
+                }
+                if self.touch.active_finger == Some(id.0) {
+                    return synth(
+                        self,
+                        Event::CursorMoved {
+                            position: *position,
+                        },
+                    );
+                }
+                false
+            }
+            touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. } => {
+                self.touch.fingers.remove(&id.0);
+
+                // Pinch'ten çıkıldı: kalan parmak yeni bir tek-parmak jesti
+                // BAŞLATMAZ (parmak zaten basılıydı; sentetik basma sıçramaya
+                // yol açardı). Kullanıcı kaldırıp tekrar basmalı.
+                if self.touch.fingers.len() < 2 {
+                    self.touch.pinch_start_dist = None;
+                }
+
+                if self.touch.active_finger == Some(id.0) {
+                    self.touch.active_finger = None;
+                    return synth(self, Event::ButtonReleased(mouse::Button::Left));
+                }
+                false
+            }
+        }
+    }
+
+    /// İki parmak arası mesafe oranından mutlak zoom uygular; pinch merkezi
+    /// (iki parmağın orta noktası) sabit kalır.
+    fn pinch_update(&mut self, viewport: DVec2) -> bool {
+        let Some(start_dist) = self.touch.pinch_start_dist else {
+            return false;
+        };
+        let pts: Vec<Vec2> = self.touch.fingers.values().copied().collect();
+        if pts.len() < 2 {
+            return false;
+        }
+        let cur_dist = pts[0].distance(pts[1]).max(1.0);
+        // Parmaklar açılınca (cur > start) yakınlaşma: half_extents küçülür.
+        let scale = (start_dist / cur_dist) as f64;
+
+        let center = (pts[0] + pts[1]) * 0.5;
+        self.cursor_position = center;
+
+        let render_before = self
+            .camera
+            .screen_to_render(DVec2::new(center.x as f64, center.y as f64), viewport);
+        self.camera.half_extents = self.touch.pinch_start_half_extents * scale;
+        let render_after = self
+            .camera
+            .screen_to_render(DVec2::new(center.x as f64, center.y as f64), viewport);
+
+        // Pinch merkezini çapala.
+        self.camera.position += render_before - render_after;
+        self.update_axis_links();
+        true
     }
 
     pub(crate) fn handle_mouse_event(
@@ -1407,6 +1535,25 @@ pub(crate) struct PanState {
     pub(crate) button: Option<mouse::Button>,
     pub(crate) start_cursor: DVec2,
     pub(crate) start_camera_center: DVec2,
+}
+
+/// Dokunmatik jest durumu.
+///
+/// Tek parmak, fare sol-tuş sürüklemesine eşlenir (pan / box-zoom / drag —
+/// hangisi `Controls`'te bağlıysa). İki parmak pinch-zoom'a geçer: ikinci parmak
+/// inince süren tek-parmak jesti iptal edilir, çünkü pan ile pinch aynı anda
+/// yürütülemez.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct TouchState {
+    /// Ekrandaki parmaklar: id → widget-yerel konum.
+    pub(crate) fingers: HashMap<u64, Vec2>,
+    /// Tek-parmak jestini süren parmak (fare sol tuşu gibi davranır).
+    pub(crate) active_finger: Option<u64>,
+    /// Pinch başlangıcındaki parmak arası mesafe (px). None = pinch aktif değil.
+    pub(crate) pinch_start_dist: Option<f32>,
+    /// Pinch başlangıcındaki kamera yarı-genişlikleri — zoom buna göre mutlak
+    /// hesaplanır (kare kare çarpım hatası birikmesin).
+    pub(crate) pinch_start_half_extents: DVec2,
 }
 
 #[derive(Default, Debug, Clone)]
