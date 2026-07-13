@@ -476,11 +476,7 @@ impl PlotState {
             None => Vec::new(),
         };
 
-        // Minimum pixel spacing between y-axis tick labels (prevents overlap on small plots)
-        const MIN_Y_TICK_SPACING_PX: f32 = 16.0;
-
         self.y_ticks.clear();
-        let mut raw_y_ticks: Vec<PositionedTick> = Vec::new();
         for tick in y_tick_values {
             let Some(tick_plot) = self.y_axis_scale.data_to_plot(tick.value) else {
                 continue;
@@ -488,21 +484,7 @@ impl PlotState {
             if let Some(screen_pos) =
                 world_to_screen_position_y(tick_plot, &self.camera, &self.bounds)
             {
-                raw_y_ticks.push(PositionedTick { screen_pos, tick });
-            }
-        }
-        // Filter: keep only ticks that are at least MIN_Y_TICK_SPACING_PX apart.
-        // screen_pos is top-to-bottom (increasing = lower on screen), so we
-        // track the last kept tick and skip ticks that are too close to it.
-        let mut last_kept_pos: Option<f32> = None;
-        for tick in raw_y_ticks {
-            let keep = match last_kept_pos {
-                None => true,
-                Some(prev) => (tick.screen_pos - prev).abs() >= MIN_Y_TICK_SPACING_PX,
-            };
-            if keep {
-                last_kept_pos = Some(tick.screen_pos);
-                self.y_ticks.push(tick);
+                self.y_ticks.push(PositionedTick { screen_pos, tick });
             }
         }
     }
