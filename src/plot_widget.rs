@@ -1684,7 +1684,19 @@ fn update_plot_program<const IS_CANVAS: bool>(
                 &mut effects.hover_pick,
                 &mut effects.drag_event,
             ) {
-                effects.capture_touch = true;
+                // Yalnız SÜRÜKLEME yutulur, BASMA değil.
+                //
+                // Yutulması gereken şey saran `scrollable`'ın kaydırmasıdır; o da
+                // kaydırmayı FingerMoved'da yapar ve capture kontrolü ondan önce
+                // gelir — dolayısıyla hareketi yutmak yeterlidir.
+                //
+                // Basmayı yutarsak üstteki `mouse_area`'nın `on_press`'i ölür
+                // (o da `is_event_captured()` görünce erken döner). Fare yolunda
+                // capture olmadığı için bu, yalnız dokunmatikte kendini gösteren
+                // sinsi bir davranış farkı yaratıyordu.
+                if matches!(touch_event, iced::touch::Event::FingerMoved { .. }) {
+                    effects.capture_touch = true;
+                }
                 effects.needs_redraw |= touch_redraw;
                 if touch_redraw {
                     invalidation.overlay_layer();
