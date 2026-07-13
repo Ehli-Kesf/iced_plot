@@ -1284,6 +1284,10 @@ struct UpdateEffects {
     /// Request publishing `camera_bounds` even when ticks didn't change.
     /// This keeps overlays in sync when tick producers are disabled.
     publish_camera_bounds: bool,
+    /// Dokunma jesti bu plot tarafından sahiplenildi → olay YUTULMALI.
+    /// Yutulmazsa plot'u saran `scrollable` aynı parmak hareketiyle paneli de
+    /// kaydırır; kullanıcı plot'u sürüklerken panel yukarı/aşağı gider.
+    capture_touch: bool,
 }
 
 #[derive(Default, Debug)]
@@ -1672,15 +1676,18 @@ fn update_plot_program<const IS_CANVAS: bool>(
         iced::Event::Touch(touch_event) => {
             // Dokunmatik: tek parmak → sol tuş sürüklemesi, iki parmak → pinch.
             // Konum dokunuş olayından gelir; imleç sentezi gerekmez.
-            let touch_redraw = state.handle_touch_event(
+            // `Some(_)` = jest bizim → olayı yut (saran scrollable kaydırmasın).
+            if let Some(touch_redraw) = state.handle_touch_event(
                 touch_event,
                 widget,
                 &mut effects.hover_pick,
                 &mut effects.drag_event,
-            );
-            effects.needs_redraw |= touch_redraw;
-            if touch_redraw {
-                invalidation.overlay_layer();
+            ) {
+                effects.capture_touch = true;
+                effects.needs_redraw |= touch_redraw;
+                if touch_redraw {
+                    invalidation.overlay_layer();
+                }
             }
         }
         iced::Event::Keyboard(keyboard_event) => {
@@ -1767,7 +1774,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.apply(widget);
     }
 
-    if needs_publish {
+    let action = if needs_publish {
         Some(shader::Action::publish(PlotUiMessage::RenderUpdate(
             PlotRenderUpdate {
                 hover_pick: effects.hover_pick,
@@ -1781,6 +1788,14 @@ fn update_plot_program<const IS_CANVAS: bool>(
         )))
     } else {
         effects.needs_redraw.then(shader::Action::request_redraw)
+    };
+
+    // Sahiplenilen dokunma jesti yutulur — yayınlanacak bir mesaj/redraw olsun
+    // ya da olmasın, olay üst katmanlara (scrollable) sızmamalı.
+    match (action, effects.capture_touch) {
+        (Some(action), true) => Some(action.and_capture()),
+        (None, true) => Some(shader::Action::capture()),
+        (action, false) => action,
     }
 }
 

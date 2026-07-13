@@ -546,7 +546,7 @@ impl PlotState {
         widget: &PlotWidget,
         publish_hover_pick: &mut Option<HoverPickEvent>,
         publish_drag_event: &mut Option<DragEvent>,
-    ) -> bool {
+    ) -> Option<bool> {
         let (touch::Event::FingerPressed { id, position }
         | touch::Event::FingerMoved { id, position }
         | touch::Event::FingerLifted { id, position }
@@ -565,9 +565,16 @@ impl PlotState {
 
         match event {
             touch::Event::FingerPressed { .. } => {
+                // Program::update olayları bounds'tan BAĞIMSIZ görür. Bu kontrol
+                // olmazsa panelin başka yerine basılan parmak da `fingers`'a
+                // girer; ardından plot'a inen ilk parmak ikinci parmak sayılıp
+                // pinch'e düşer ve plot bir daha sürüklenemez.
+                if !self.point_inside(local.x, local.y) {
+                    return None;
+                }
                 self.touch.fingers.insert(id.0, local);
 
-                match self.touch.fingers.len() {
+                let redraw = match self.touch.fingers.len() {
                     1 => {
                         self.touch.active_finger = Some(id.0);
                         synth(self, Event::ButtonPressed(mouse::Button::Left))
@@ -585,28 +592,34 @@ impl PlotState {
                         self.touch.pinch_start_half_extents = self.camera.half_extents;
                         redraw
                     }
-                    // 3+ parmak: yoksay.
+                    // 3+ parmak: yoksay, ama jest yine bizim (yutulur).
                     _ => false,
-                }
+                };
+                Some(redraw)
             }
             touch::Event::FingerMoved { .. } => {
+                // Yalnız İZLEDİĞİMİZ parmakların hareketi bizi ilgilendirir.
+                if !self.touch.fingers.contains_key(&id.0) {
+                    return None;
+                }
                 self.touch.fingers.insert(id.0, local);
 
                 if self.touch.fingers.len() >= 2 {
-                    return self.pinch_update(viewport);
+                    return Some(self.pinch_update(viewport));
                 }
                 if self.touch.active_finger == Some(id.0) {
-                    return synth(
+                    return Some(synth(
                         self,
                         Event::CursorMoved {
                             position: *position,
                         },
-                    );
+                    ));
                 }
-                false
+                Some(false)
             }
             touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. } => {
-                self.touch.fingers.remove(&id.0);
+                // İzlemediğimiz bir parmağın kalkışı bizi ilgilendirmez.
+                self.touch.fingers.remove(&id.0)?;
 
                 // Pinch'ten çıkıldı: kalan parmak yeni bir tek-parmak jesti
                 // BAŞLATMAZ (parmak zaten basılıydı; sentetik basma sıçramaya
@@ -617,9 +630,9 @@ impl PlotState {
 
                 if self.touch.active_finger == Some(id.0) {
                     self.touch.active_finger = None;
-                    return synth(self, Event::ButtonReleased(mouse::Button::Left));
+                    return Some(synth(self, Event::ButtonReleased(mouse::Button::Left)));
                 }
-                false
+                Some(false)
             }
         }
     }
