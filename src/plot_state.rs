@@ -535,8 +535,9 @@ impl PlotState {
     ///
     /// Tek parmak, sol fare tuşu sürüklemesine eşlenip [`Self::handle_mouse_event`]
     /// yoluna beslenir — pan/box-zoom/drag ayrımını `Controls` yapar, mantık
-    /// tek yerde kalır. Konum `cursor`'dan DEĞİL, dokunuş olayından alınır:
-    /// böylece davranış imleç sentezleyen bir winit yamasına bağımlı olmaz.
+    /// tek yerde kalır. Tek-parmak konumu `cursor`'dan okunur (aşağıdaki uzun
+    /// yorum), parmaklar-arası pinch geometrisi ise ham `touch::Event.position`
+    /// üzerinden hesaplanır (yorumdaki İSTİSNA).
     ///
     /// İki parmak pinch-zoom'a geçer; ikinci parmak inince süren tek-parmak
     /// jesti (sentetik bırakma ile) iptal edilir.
@@ -548,10 +549,14 @@ impl PlotState {
         publish_hover_pick: &mut Option<HoverPickEvent>,
         publish_drag_event: &mut Option<DragEvent>,
     ) -> Option<bool> {
-        let (touch::Event::FingerPressed { id, .. }
-        | touch::Event::FingerMoved { id, .. }
-        | touch::Event::FingerLifted { id, .. }
-        | touch::Event::FingerLost { id, .. }) = event;
+        let (touch::Event::FingerPressed { id, position }
+        | touch::Event::FingerMoved { id, position }
+        | touch::Event::FingerLifted { id, position }
+        | touch::Event::FingerLost { id, position }) = event;
+
+        // Parmağın HAM pencere konumu — yalnız parmaklar-arası geometri için,
+        // aşağıdaki istisna yorumuna bak.
+        let raw = Vec2::new(position.x, position.y);
 
         // Konum `touch::Event.position`'dan DEĞİL, `cursor`'dan okunur.
         //
@@ -565,6 +570,17 @@ impl PlotState {
         // Bu, cursor'ı dokunuştan sentezleyen winit yamasına bağımlılık yaratır;
         // Android'de yama tam da bunu yapar (stok iced widget'ları da aynı
         // sentezi kullanır, yoksa hiçbir buton dokunuşla çalışmazdı).
+        //
+        // İSTİSNA — parmaklar-arası GEOMETRİ (pinch mesafesi/orta noktası):
+        // iced olayları TOPLU işler ve bir toplamdaki TÜM olaylara TEK cursor
+        // anlık görüntüsü (toplamdaki son dokunuşun konumu) verilir. Android
+        // MotionEvent tüm parmakları tek pakette taşıdığından pinch sırasında
+        // iki parmağın FingerMoved'ları aynı toplama düşer: cursor'dan okunan
+        // konumlar tek noktaya çöker, parmak mesafesi ~0 olur ve zoom patlar.
+        // Bu yüzden pinch geometrisi parmak başına doğru olan HAM `raw`
+        // konumlardan hesaplanır — mesafe ötelemeden bağımsızdır, orta nokta
+        // ise pinch başında sabitlenen `touch_translation` ile yerel uzaya
+        // taşınır.
         let local = self.cursor_local_position(cursor, true)?;
         let viewport: DVec2 = Vec2::new(self.bounds.width, self.bounds.height).into();
 
@@ -581,11 +597,15 @@ impl PlotState {
                 if !self.point_inside(local.x, local.y) {
                     return None;
                 }
-                self.touch.fingers.insert(id.0, local);
+                self.touch.fingers.insert(id.0, raw);
 
                 let redraw = match self.touch.fingers.len() {
                     1 => {
                         self.touch.active_finger = Some(id.0);
+                        // Basış kendi toplamında gelir: cursor bu parmağı gösterir,
+                        // ham→yerel öteleme burada sabitlenir. Tek-parmak pan da
+                        // bunu kullanır (aşağıdaki FingerMoved dalı).
+                        self.touch.touch_translation = local - raw;
                         synth(self, Event::ButtonPressed(mouse::Button::Left))
                     }
                     2 => {
@@ -598,6 +618,11 @@ impl PlotState {
                         }
                         let pts: Vec<Vec2> = self.touch.fingers.values().copied().collect();
                         self.touch.pinch_start_dist = Some(pts[0].distance(pts[1]).max(1.0));
+                        // Bu basış anında cursor bu parmağa karşılık gelir
+                        // (basış kendi toplamında gelir): ham→yerel ötelemeyi
+                        // şimdi sabitle. Jest boyunca FingerMoved'lar yutulduğu
+                        // için saran `scrollable` kayamaz, öteleme değişmez.
+                        self.touch.touch_translation = local - raw;
                         self.touch.pinch_start_half_extents = self.camera.half_extents;
                         redraw
                     }
@@ -611,17 +636,18 @@ impl PlotState {
                 if !self.touch.fingers.contains_key(&id.0) {
                     return None;
                 }
-                self.touch.fingers.insert(id.0, local);
+                self.touch.fingers.insert(id.0, raw);
 
                 if self.touch.fingers.len() >= 2 {
                     return Some(self.pinch_update(viewport));
                 }
                 if self.touch.active_finger == Some(id.0) {
-                    // `handle_mouse_event`'in CursorMoved kolu konumu `cursor`'dan
-                    // okur; bu alan yalnız varyantı kurmak için gerekli.
-                    let position =
-                        iced::Point::new(local.x + self.bounds.x, local.y + self.bounds.y);
-                    return Some(synth(self, Event::CursorMoved { position }));
+                    // Cursor DEĞİL, ham konum + jest ötelemesi: ikinci parmağın
+                    // indiği toplu işlemede bu parmağın hareketi de bulunur ve
+                    // cursor o an İKİNCİ parmağı gösterir — cursor'dan okusak
+                    // pan kamerayı ikinci parmağın konumuna sıçratırdı.
+                    let est_local = raw + self.touch.touch_translation;
+                    return Some(self.on_cursor_moved_local(est_local, widget, publish_drag_event));
                 }
                 Some(false)
             }
@@ -636,17 +662,36 @@ impl PlotState {
                     self.touch.pinch_start_dist = None;
                 }
 
+                let mut redraw = false;
                 if self.touch.active_finger == Some(id.0) {
                     self.touch.active_finger = None;
-                    return Some(synth(self, Event::ButtonReleased(mouse::Button::Left)));
+                    redraw = synth(self, Event::ButtonReleased(mouse::Button::Left));
                 }
-                Some(false)
+
+                // Son parmak kalktı: sentetik bırakma hangi yoldan işlenirse
+                // işlensin fare-jesti durumları AÇIK KALAMAZ — dokunmatikte
+                // bırakmadan sonra düzeltici bir fare olayı asla gelmez. Bu,
+                // sentetik ButtonReleased'ten SONRA çalışan emniyettir (önce
+                // çalışsaydı DragEvent::End yayınını da yutardı): bırakma
+                // konumu bulunamayıp erken dönülen yollarda bile plot,
+                // Stack'i zehirleyen kalıcı bir `pan.active` bırakamaz.
+                if self.touch.fingers.is_empty() {
+                    self.pan.active = false;
+                    self.pan.button = None;
+                    self.selection.active = false;
+                    self.selection.button = None;
+                    self.selection.moved = false;
+                    self.drag.active = false;
+                    self.drag.button = None;
+                }
+                Some(redraw)
             }
         }
     }
 
     /// İki parmak arası mesafe oranından mutlak zoom uygular; pinch merkezi
-    /// (iki parmağın orta noktası) sabit kalır.
+    /// (iki parmağın orta noktası) sabit kalır. Geometri, `fingers`'taki HAM
+    /// konumlardan hesaplanır — gerekçe için [`Self::handle_touch_event`].
     fn pinch_update(&mut self, viewport: DVec2) -> bool {
         let Some(start_dist) = self.touch.pinch_start_dist else {
             return false;
@@ -659,7 +704,8 @@ impl PlotState {
         // Parmaklar açılınca (cur > start) yakınlaşma: half_extents küçülür.
         let scale = (start_dist / cur_dist) as f64;
 
-        let center = (pts[0] + pts[1]) * 0.5;
+        // Konumlar ham pencere uzayında; orta noktayı widget-yerel uzaya taşı.
+        let center = (pts[0] + pts[1]) * 0.5 + self.touch.touch_translation;
         self.cursor_position = center;
 
         let render_before = self
@@ -674,6 +720,81 @@ impl PlotState {
         self.camera.position += render_before - render_after;
         self.update_axis_links();
         true
+    }
+
+    /// `CursorMoved` gövdesi, konumu ÇÖZÜLMÜŞ yerel koordinatla.
+    ///
+    /// Fare yolu konumu `cursor`'dan çözer; dokunma yolu ise ham olay konumu +
+    /// jest ötelemesini verir — iced'in toplu işlemesinde cursor son olayın
+    /// parmağını gösterdiğinden (bkz. `handle_touch_event` istisna yorumu),
+    /// pinch'e girerken aynı toplama düşen tek-parmak hareketi cursor'dan
+    /// okunursa pan karşı parmağın konumuna sıçrar.
+    fn on_cursor_moved_local(
+        &mut self,
+        position: Vec2,
+        widget: &PlotWidget,
+        publish_drag_event: &mut Option<DragEvent>,
+    ) -> bool {
+        let mut needs_redraw = false;
+        let viewport: DVec2 = Vec2::new(self.bounds.width, self.bounds.height).into();
+        let inside = self.point_inside(position.x, position.y);
+
+        self.cursor_position = position;
+        // Update crosshairs position when enabled
+        if widget.crosshairs_enabled {
+            self.crosshairs_position = self.cursor_position;
+            needs_redraw = true;
+        }
+
+        // Handle selection (right click drag)
+        if self.selection.active {
+            self.selection.end = self.cursor_position;
+            self.selection.moved = true;
+            needs_redraw = true;
+        }
+
+        // Handle panning (left click drag)
+        if self.pan.active {
+            // Convert screen positions to render coordinates (without offset)
+            let render_current = self.camera.screen_to_render(
+                DVec2::new(self.cursor_position.x as f64, self.cursor_position.y as f64),
+                viewport,
+            );
+            let render_start = self
+                .camera
+                .screen_to_render(self.pan.start_cursor, viewport);
+            let render_delta = render_current - render_start;
+
+            // Update camera position by applying the render space delta
+            self.camera.position = self.pan.start_camera_center - render_delta;
+            self.update_axis_links();
+            needs_redraw = true;
+        }
+
+        if self.drag.active
+            && let Some(button) = self.drag.button
+            && let Some(world) = self.cursor_world_data(viewport)
+        {
+            *publish_drag_event = Some(DragEvent::Update { button, world });
+        }
+
+        // Hover picking (only when not panning or selecting)
+        if !self.pan.active && !self.selection.active && self.hover_enabled {
+            if !inside {
+                // If cursor leaves this widget, clear hover state for this widget only
+                if self.picking.last_hover_cache.is_some() {
+                    self.picking.last_hover_cache = None;
+                    // Redraw once to clear hover halo overlay
+                    needs_redraw = true;
+                }
+                return needs_redraw;
+            } else {
+                // Inside bounds and hover enabled: request a redraw so the renderer
+                // can service the GPU picking request for this cursor position.
+                needs_redraw = true;
+            }
+        }
+        needs_redraw
     }
 
     pub(crate) fn handle_mouse_event(
@@ -700,63 +821,7 @@ impl PlotState {
                     }
                     return needs_redraw;
                 };
-                let inside = self.point_inside(position.x, position.y);
-
-                self.cursor_position = position;
-                // Update crosshairs position when enabled
-                if widget.crosshairs_enabled {
-                    self.crosshairs_position = self.cursor_position;
-                    needs_redraw = true;
-                }
-
-                // Handle selection (right click drag)
-                if self.selection.active {
-                    self.selection.end = self.cursor_position;
-                    self.selection.moved = true;
-                    needs_redraw = true;
-                }
-
-                // Handle panning (left click drag)
-                if self.pan.active {
-                    // Convert screen positions to render coordinates (without offset)
-                    let render_current = self.camera.screen_to_render(
-                        DVec2::new(self.cursor_position.x as f64, self.cursor_position.y as f64),
-                        viewport,
-                    );
-                    let render_start = self
-                        .camera
-                        .screen_to_render(self.pan.start_cursor, viewport);
-                    let render_delta = render_current - render_start;
-
-                    // Update camera position by applying the render space delta
-                    self.camera.position = self.pan.start_camera_center - render_delta;
-                    self.update_axis_links();
-                    needs_redraw = true;
-                }
-
-                if self.drag.active
-                    && let Some(button) = self.drag.button
-                    && let Some(world) = self.cursor_world_data(viewport)
-                {
-                    *publish_drag_event = Some(DragEvent::Update { button, world });
-                }
-
-                // Hover picking (only when not panning or selecting)
-                if !self.pan.active && !self.selection.active && self.hover_enabled {
-                    if !inside {
-                        // If cursor leaves this widget, clear hover state for this widget only
-                        if self.picking.last_hover_cache.is_some() {
-                            self.picking.last_hover_cache = None;
-                            // Redraw once to clear hover halo overlay
-                            needs_redraw = true;
-                        }
-                        return needs_redraw;
-                    } else {
-                        // Inside bounds and hover enabled: request a redraw so the renderer
-                        // can service the GPU picking request for this cursor position.
-                        needs_redraw = true;
-                    }
-                }
+                return self.on_cursor_moved_local(position, widget, publish_drag_event);
             }
             Event::CursorLeft => {
                 // Clear hover state on leave and request a redraw to clear hover halo
@@ -823,6 +888,24 @@ impl PlotState {
                     if self.press.button == Some(button) {
                         self.press.active = false;
                         self.press.button = None;
+                    }
+                    // Erken dönüşte jest durumları da MUTLAKA kapanır. Eskiden
+                    // pan/selection burada açık kalabiliyordu; koşulsuz
+                    // `Grabbing` bildiren yarım pan, iced Stack'in üst-katman
+                    // maskelemesiyle birleşince alttaki katmanları imleçsiz
+                    // bırakıyordu (bkz. `plot_mouse_interaction`).
+                    if self.pan.button == Some(button) {
+                        self.pan.active = false;
+                        self.pan.button = None;
+                    }
+                    if self.selection.button == Some(button) {
+                        self.selection.active = false;
+                        self.selection.button = None;
+                        self.selection.moved = false;
+                    }
+                    if self.drag.button == Some(button) {
+                        self.drag.active = false;
+                        self.drag.button = None;
                     }
                     return needs_redraw;
                 } else {
@@ -1548,7 +1631,12 @@ pub(crate) struct PanState {
 /// yürütülemez.
 #[derive(Default, Debug, Clone)]
 pub(crate) struct TouchState {
-    /// Ekrandaki parmaklar: id → widget-yerel konum.
+    /// Ekrandaki parmaklar: id → HAM konum (`touch::Event.position`).
+    ///
+    /// Widget-yerel (cursor tabanlı) DEĞİL: toplu işlenen olaylar tek cursor
+    /// anlık görüntüsü paylaştığından cursor'dan okunan konumlar pinch'te tek
+    /// noktaya çöker — gerekçe için [`PlotState::handle_touch_event`]. Yerel
+    /// uzaya çeviri için `touch_translation` eklenir.
     pub(crate) fingers: HashMap<u64, Vec2>,
     /// Tek-parmak jestini süren parmak (fare sol tuşu gibi davranır).
     pub(crate) active_finger: Option<u64>,
@@ -1557,6 +1645,10 @@ pub(crate) struct TouchState {
     /// Pinch başlangıcındaki kamera yarı-genişlikleri — zoom buna göre mutlak
     /// hesaplanır (kare kare çarpım hatası birikmesin).
     pub(crate) pinch_start_half_extents: DVec2,
+    /// Ham pencere uzayından widget-yerel uzaya öteleme; pinch başında
+    /// `local - raw` olarak sabitlenir ve jest boyunca değişmez (FingerMoved'lar
+    /// yutulduğu için saran `scrollable` bu sırada kayamaz).
+    pub(crate) touch_translation: Vec2,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -2132,6 +2224,158 @@ mod tests {
 
         assert!(changed);
         assert_eq!(state.camera.position, DVec2::new(20.0, 40.0));
+    }
+
+    /// Android toplu olay senaryosu: iki parmağın FingerMoved'ları aynı toplama
+    /// düşer ve İKİSİ DE toplamdaki son dokunuşun cursor anlık görüntüsünü alır.
+    /// Geometri cursor'dan okunsaydı parmaklar tek noktaya çöker, mesafe 1.0'a
+    /// sabitlenir ve `scale = start_dist/1.0` ile kamera patlardı. Ham konumlar
+    /// kullanıldığından zoom doğru oranda kalmalı.
+    #[test]
+    fn pinch_survives_batched_cursor_collapse() {
+        let widget = PlotWidget::new();
+        let mut state = PlotState {
+            bounds: Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            ..PlotState::default()
+        };
+        state.camera.half_extents = DVec2::new(10.0, 5.0);
+        let start_half_extents = state.camera.half_extents;
+
+        // Saran `scrollable` cursor'ı öteler ama ham konum pencere uzayında
+        // kalır; sabit (5, 7) ötelemesiyle bunu taklit ediyoruz.
+        let offset = Vec2::new(5.0, 7.0);
+        let cursor_for =
+            |raw: Vec2| mouse::Cursor::Available(Point::new(raw.x + offset.x, raw.y + offset.y));
+
+        let mut hover_pick = None;
+        let mut drag_event = None;
+        let mut touch = |state: &mut PlotState, ev: touch::Event, cursor: mouse::Cursor| {
+            state.handle_touch_event(&ev, cursor, &widget, &mut hover_pick, &mut drag_event)
+        };
+
+        // İki parmak basar; her basış kendi toplamında gelir (cursor kendi
+        // konumuna karşılık gelir).
+        let a0 = Vec2::new(20.0, 50.0);
+        let b0 = Vec2::new(80.0, 50.0);
+        touch(
+            &mut state,
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position: Point::new(a0.x, a0.y),
+            },
+            cursor_for(a0),
+        );
+        touch(
+            &mut state,
+            touch::Event::FingerPressed {
+                id: touch::Finger(2),
+                position: Point::new(b0.x, b0.y),
+            },
+            cursor_for(b0),
+        );
+
+        assert_eq!(state.touch.pinch_start_dist, Some(60.0));
+        assert_eq!(state.touch.touch_translation, offset);
+
+        // Parmaklar açılır (60 px → 80 px). İki FingerMoved AYNI toplamda:
+        // ikisine de SON olayın (B) cursor'ı verilir.
+        let a1 = Vec2::new(10.0, 50.0);
+        let b1 = Vec2::new(90.0, 50.0);
+        let batched_cursor = cursor_for(b1);
+        touch(
+            &mut state,
+            touch::Event::FingerMoved {
+                id: touch::Finger(1),
+                position: Point::new(a1.x, a1.y),
+            },
+            batched_cursor,
+        );
+        let redraw = touch(
+            &mut state,
+            touch::Event::FingerMoved {
+                id: touch::Finger(2),
+                position: Point::new(b1.x, b1.y),
+            },
+            batched_cursor,
+        );
+        assert_eq!(redraw, Some(true));
+
+        // scale = 60 / 80 = 0.75 — kamera patlamadı, oran doğru.
+        let expected = start_half_extents * 0.75;
+        assert!((state.camera.half_extents.x - expected.x).abs() < 1e-9);
+        assert!((state.camera.half_extents.y - expected.y).abs() < 1e-9);
+
+        // Pinch merkezi: ham orta nokta (50, 50) + öteleme = widget-yerel (55, 57).
+        assert_eq!(state.cursor_position, Vec2::new(55.0, 57.0));
+    }
+
+    /// Tek-parmak pan, ikinci parmağın indiği toplu işlemede sıçramamalı.
+    ///
+    /// Android'de POINTER_DOWN paketi çoğu kez birinci parmağın MOVE'uyla aynı
+    /// toplama düşer ve cursor İKİNCİ parmağı gösterir. Pan konumu cursor'dan
+    /// okunsaydı kamera bir karede karşı parmağın konumuna savrulurdu; ham
+    /// konum + jest ötelemesi kullanıldığından kamera yalnız parmağın GERÇEK
+    /// hareketi kadar kaymalı.
+    #[test]
+    fn single_finger_pan_ignores_batched_cursor_of_other_finger() {
+        let widget = PlotWidget::new();
+        let mut state = PlotState {
+            bounds: Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            ..PlotState::default()
+        };
+        state.camera.half_extents = DVec2::new(10.0, 5.0);
+        let start_camera = state.camera.position;
+
+        let offset = Vec2::new(5.0, 7.0);
+        let cursor_for =
+            |raw: Vec2| mouse::Cursor::Available(Point::new(raw.x + offset.x, raw.y + offset.y));
+
+        let mut hover_pick = None;
+        let mut drag_event = None;
+        let mut touch = |state: &mut PlotState, ev: touch::Event, cursor: mouse::Cursor| {
+            state.handle_touch_event(&ev, cursor, &widget, &mut hover_pick, &mut drag_event)
+        };
+
+        // Parmak A basar ve pan başlar.
+        let a0 = Vec2::new(40.0, 50.0);
+        touch(
+            &mut state,
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position: Point::new(a0.x, a0.y),
+            },
+            cursor_for(a0),
+        );
+        assert!(state.pan.active);
+
+        // Parmak A yalnız 2 px sağa kayar; ama olay, B'nin inişiyle AYNI
+        // toplamda geldiği için cursor B'nin (çok uzaktaki) konumunu gösterir.
+        let a1 = Vec2::new(42.0, 50.0);
+        let b0 = Vec2::new(90.0, 10.0);
+        touch(
+            &mut state,
+            touch::Event::FingerMoved {
+                id: touch::Finger(1),
+                position: Point::new(a1.x, a1.y),
+            },
+            cursor_for(b0), // toplu işlemenin son olayı B → cursor B'de
+        );
+
+        // Kamera yalnız A'nın gerçek 2 px'lik hareketi kadar kaydı; B'nin
+        // konumuna sıçramadı. 100 px genişlik / 20 dünya birimi → 2 px = 0.4.
+        let dx = (state.camera.position.x - start_camera.x).abs();
+        assert!(dx < 0.5, "pan sıçradı: dx={dx}");
+        assert!(dx > 0.3, "pan hiç işlemedi: dx={dx}");
     }
 
     fn arrow_key_event(named: keyboard::key::Named, code: keyboard::key::Code) -> keyboard::Event {

@@ -1812,7 +1812,17 @@ fn update_plot_program<const IS_CANVAS: bool>(
     }
 }
 
-fn plot_mouse_interaction(state: &PlotState) -> Interaction {
+fn plot_mouse_interaction(state: &PlotState, cursor: mouse::Cursor) -> Interaction {
+    // İmleç YOKKEN (dokunuş bitti / iced Stack üst katman maskelemesi) her
+    // zaman `None`: mouse_interaction bir imleç SİMGESİ seçer, imleç yoksa
+    // simge de yoktur. Bundan fazlası zararlıdır — iced `Stack`, üst katman
+    // non-None bildirdiğinde ALTTAKİ tüm katmanların imlecini söndürür
+    // (stack.rs `cursor.levitate()`); koşulsuz `Grabbing` bildiren yarım
+    // kalmış bir pan, detay paneli açıkken sol drone listesini tümüyle
+    // sağırlaştırıyordu.
+    if cursor.position().is_none() {
+        return Interaction::None;
+    }
     if state.pan.active {
         Interaction::Grabbing
     } else if state.selection.active {
@@ -1856,9 +1866,9 @@ impl shader::Program<PlotUiMessage> for PlotWidget {
         &self,
         state: &Self::State,
         _bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Interaction {
-        plot_mouse_interaction(state)
+        plot_mouse_interaction(state, cursor)
     }
 }
 
@@ -1891,9 +1901,9 @@ impl iced::widget::canvas::Program<PlotUiMessage> for PlotWidget {
         &self,
         state: &Self::State,
         _bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Interaction {
-        plot_mouse_interaction(state)
+        plot_mouse_interaction(state, cursor)
     }
 }
 
